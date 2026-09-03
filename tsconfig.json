@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",              // 用最新的 JS 语法
+    "module": "NodeNext",              // 用最新的模块系统
+    "moduleResolution": "NodeNext",      // 按 Node.js 的方式找依赖
+    "esModuleInterop": true,         // 允许导入 CommonJS 包
+    "types": ["node"],               // 提供 node:test、node:assert 等 Node.js 类型
+    "strict": true,                 // 开启严格模式，尽早发现类型问题
+    "skipLibCheck": true,            // 跳过检查第三方库（提速）
+    "outDir": "./dist",
+    "rootDir": "./",               // 同时包含 src 和 test
+  },
+  "include": ["src/**/*", "test/**/*"], // 检查源码和测试
+  "exclude": ["node_modules"]
+}

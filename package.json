@@ -1,0 +1,34 @@
+{
+  "name": "mini-dsh-learn",
+  "private": true,
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.ts",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "scripts": {
+    "start": "node --import=tsx src/index.ts",
+    "test": "node --import=tsx --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.18.0",
+      "onFail": "ignore"
+    }
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1"
+  }
+}
