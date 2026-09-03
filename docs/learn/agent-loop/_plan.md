@@ -2,7 +2,7 @@
 
 > 生成时间：2026-09-03
 > 基于 spec：[_spec.md](./_spec.md)
-> 状态：待用户批准
+> 状态：已完成
 **Goal：** 按已批准的规格落地一份完整的 Agent Loop 中文入门指南，
 产出 `_spec.md`、`_plan.md`、`agent-loop.md` 三份 Markdown。
 **Architecture：** 采用单文件正文。Task 1 编写并自查 `agent-loop.md`，
@@ -35,8 +35,8 @@ Task 2 做整体验收。正文不修改项目源码，只解释基线 commit �
 | 文件 | 状态 | 说明 |
 | --- | --- | --- |
 | `docs/learn/agent-loop/_spec.md` | 已批准 | 教程范围和验收标准 |
-| `docs/learn/agent-loop/_plan.md` | 当前文件 | 教程实施步骤 |
-| `docs/learn/agent-loop/agent-loop.md` | 待创建 | 单文件中文整合教程 |
+| `docs/learn/agent-loop/_plan.md` | 已完成 | 教程实施步骤 |
+| `docs/learn/agent-loop/agent-loop.md` | 已完成 | 单文件中文整合教程 |
 
 ---
 
@@ -154,17 +154,17 @@ git commit -m "docs(learn): add agent-loop tutorial"
 - 对照 commit `2fbb62996bbf16d556a627ad5646af2ffa6c415b`
 
 ### Step 3：正文结构检查
-- [ ] 包含三档阅读路线
-- [ ] 包含类比开场
-- [ ] 包含 Agent Loop 全景图
-- [ ] 包含主循环逐步讲解
-- [ ] 包含四个新增文件的逐行讲解
-- [ ] 包含四个新增测试的详细拆解
-- [ ] 包含多工具取消专题
-- [ ] 包含设计决策和常见错误
-- [ ] 包含 18 道面试问答
-- [ ] 包含源码索引
-- [ ] 文末只有一个“一句话记住”
+- [x] 包含三档阅读路线
+- [x] 包含类比开场
+- [x] 包含 Agent Loop 全景图
+- [x] 包含主循环逐步讲解
+- [x] 包含四个新增文件的逐行讲解
+- [x] 包含四个新增测试的详细拆解
+- [x] 包含多工具取消专题
+- [x] 包含设计决策和常见错误
+- [x] 包含 18 道面试问答
+- [x] 包含源码索引
+- [x] 文末只有一个“一句话记住”
 
 ### Step 4：最终提交
 全部验收通过后创建空提交：
