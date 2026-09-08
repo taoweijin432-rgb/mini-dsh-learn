@@ -403,66 +403,88 @@ test('Cancelling a multi-tool turn still records a result for every tool_call', 
 });
 
 test('streamed tool_calls concatenate name once, not read_fileread_file', async () => {
+  // 动态 import 只在这个测试真正执行时加载 DeepSeek 模块。
+  // `await` 等待模块加载完成，解构只取出本测试需要的函数。
   const { accumulateToolCallDelta } = await import('../src/models/deepseek.js');
+  // Map 用 index 作为 key，保存每个工具调用的累积状态。
   const map = new Map();
 
+  // 第一段 delta 提供完整工具名和 id，但参数暂时为空。
   accumulateToolCallDelta(map, {
     index: 0,
     id: 'call_1',
     function: { name: 'read_file', arguments: '' },
   });
+  // 第二段 delta 只提供参数片段；函数应该找到 index=0 的旧对象并追加参数。
   accumulateToolCallDelta(map, {
     index: 0,
     function: { arguments: '{"path":"README.md"}' },
   });
 
+  // `map.get(0)` 取回第 0 个工具调用；断言它仍保留第一段的 name 和 id。
   assert.equal(map.get(0).name, 'read_file');
   assert.equal(map.get(0).id, 'call_1');
   assert.equal(map.get(0).arguments, '{"path":"README.md"}');
 
+  // 再单独测试工具名被拆成 "ba" + "sh" 的情况。
   const streamed = new Map();
   accumulateToolCallDelta(streamed, { index: 0, function: { name: 'ba' } });
   accumulateToolCallDelta(streamed, { index: 0, function: { name: 'sh' } });
+  // 如果实现错误地“覆盖”而不是“追加”，这里会只得到 sh。
   assert.equal(streamed.get(0).name, 'bash');
 });
 
 test('parseSSE flushes a last line without a trailing newline and recognizes data:[DONE]', async () => {
+  // 只导入 SSE 解析器，不建立真实网络连接。
   const { parseSSE } = await import('../src/models/deepseek.js');
+  // TextEncoder 把测试用的字符串编码成 parseSSE 读取的 Uint8Array。
   const encoder = new TextEncoder();
+  // 第一行有换行，第二个事件和 [DONE] 故意测试“最后一行没有换行”的边界。
   const chunks = [
     'data: {"choices":[{"delta":{"content":"Hel"}}]}\n',
     'data: {"choices":[{"delta":{"content":"lo"}}]}\n',
     'data:[DONE]',
   ];
+  // i 表示下一次 read() 应该返回 chunks 中的第几项。
   let i = 0;
+  // 这是一个最小假的 Response，只实现 parseSSE 依赖的 body.getReader()。
   const response = {
     body: {
       getReader() {
         return {
+          // 每次 read() 返回一个 Promise，模拟真实网络流的异步读取。
           async read() {
+            // 所有 chunk 发完后返回 done=true，表示流结束。
             if (i >= chunks.length) return { done: true, value: undefined };
+            // Uint8Array 是 Web Streams 常见的二进制数据格式。
             return { done: false, value: encoder.encode(chunks[i++]) };
           },
+          // 测试 reader 不需要真正释放资源，但要提供这个可选方法。
           releaseLock() {},
         };
       },
     },
   };
 
+  // 收集异步生成器通过 yield 产生的所有事件。
   const events = [];
   for await (const event of parseSSE(response)) events.push(event);
+  // [DONE] 不应生成事件，所以最终只有 Hel 和 lo 两个 JSON 事件。
   assert.equal(events.length, 2);
+  // 逐层访问 choices -> 第一个元素 -> delta -> content，验证解析结果。
   assert.equal(events[0].choices[0].delta.content, 'Hel');
   assert.equal(events[1].choices[0].delta.content, 'lo');
 });
 
 test('finalizeToolCalls sorts by index, drops empty names, and throws on invalid JSON', async () => {
+  // 一次导入三个纯函数，测试工具调用从累积到最终格式化的完整过程。
   const {
     accumulateToolCallDelta,
     finalizeToolCalls,
     parseToolArguments,
   } = await import('../src/models/deepseek.js');
 
+  // 故意先写 index=1，再写 index=0，验证 finalizeToolCalls 会重新排序。
   const map = new Map();
   accumulateToolCallDelta(map, {
     index: 1,
@@ -474,15 +496,22 @@ test('finalizeToolCalls sorts by index, drops empty names, and throws on invalid
     id: 'a',
     function: { name: 'read_file', arguments: '{"path":"a"}' },
   });
+  // 这一项没有 name，虽然有参数，但不能被 Agent Loop 执行，应该被过滤。
   accumulateToolCallDelta(map, { index: 2, function: { arguments: '{' } });
 
+  // finalizeToolCalls 会完成排序、过滤，并把 JSON 参数转换为对象。
   const calls = finalizeToolCalls(map);
+  // index=2 因为没有工具名被丢掉，所以只剩两个调用。
   assert.equal(calls.length, 2);
+  // index=0 的 read_file 应排在 index=1 的 grep 前面。
   assert.equal(calls[0].name, 'read_file');
   assert.equal(calls[1].name, 'grep');
+  // arguments 不再是字符串，而是 JSON.parse 后的普通对象。
   assert.deepEqual(calls[0].arguments, { path: 'a' });
 
+  // 空参数是合法的“无参数工具调用”，应该转换成空对象。
   assert.deepEqual(parseToolArguments(''), {});
+  // 不完整 JSON 表示流被截断，应该抛出约定的错误。
   assert.throws(
     () => parseToolArguments('{"path":'),
     /incomplete tool arguments JSON/,
