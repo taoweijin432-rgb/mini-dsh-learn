@@ -12,7 +12,7 @@ import type {
 } from '../core/agent-loop-runtime.js';
 
 // inject 声明本插件需要哪些 Cordis 服务。
-// 不写 sandbox，因为第 5 天的 CLI 还没有沙箱能力。
+// sandbox 负责文件写入和 Bash 执行前的批准。
 export const inject = [
   'sessions',
   'agents',
@@ -20,6 +20,7 @@ export const inject = [
   'tools',
   'systemPrompt',
   'llm',
+  'sandbox',
 ];
 
 // CLI 配置类型；调用者可以传一个初始模型。
@@ -77,13 +78,17 @@ export function apply(ctx: any, config: CliConfig = {}): void {
   let disposed = false;
   // 记录是否已经输出过 "Agent > "，用于决定最后是否补换行。
   let contentStarted = false;
+  // running 表示是否正在处理一轮用户请求。
+  let running = false;
+  // 审批问题由 readline 自己接收输入；此时 Esc 不能被当成取消请求。
+  let approvalInProgress = false;
 
   // 创建 readline：
   // input 是输入来源，output 是提示符输出位置，prompt 是每轮显示的提示文字。
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: 'You > ',
+    prompt: 'User > ',
   });
   // 先记住 stdin 原来的 raw mode，退出时恢复它。
   const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false;
@@ -93,8 +98,31 @@ export function apply(ctx: any, config: CliConfig = {}): void {
     process.stdin.setRawMode(true);
   }
 
+  /**
+   * 把 SandboxRuntime 的批准回调接到当前 CLI 的 readline。
+   */
+  const askApproval = (request: { summary?: string }) => {
+    const wasRunning = running;
+    running = false;
+    approvalInProgress = true;
+    if (request.summary) process.stdout.write(`\n[approval] ${request.summary}\n`);
+
+    return new Promise<boolean>(resolve => {
+      rl.question('Allow this? [Y/n] ', answer => {
+        const normalized = answer.trim().toLowerCase();
+        const approved = !normalized || normalized === 'y' || normalized === 'yes';
+        if (!approved) console.log('rejected.');
+        approvalInProgress = false;
+        running = wasRunning;
+        resolve(approved);
+      });
+    });
+  };
+
   // stdin 的 data 事件会在收到原始字节时触发。
   const onData = (chunk: Buffer | string) => {
+    // 审批期间由 readline.question 专门处理 Y/N，Esc 不应抢走这次输入。
+    if (approvalInProgress) return;
     // 只取消“单独的 Esc 字节”。方向键通常是 Esc + '[' + 其他字节。
     // Buffer.from 能把字符串或已有 Buffer 统一成字节数组。
     const bytes = Buffer.from(chunk);
@@ -124,7 +152,16 @@ export function apply(ctx: any, config: CliConfig = {}): void {
 
   // 让 Cordis 在 CLI 插件卸载时自动移除 stdin 监听和 readline。
   // ctx.effect 会记住 cleanup，在上下文销毁时调用它。
-  ctx.effect(() => cleanup, 'cli readline');
+  const disposeApprover = ctx.sandbox.setApprover(askApproval);
+  ctx.effect(
+    () => () => {
+      // 先移除批准回调，再关闭 readline，避免卸载过程中留下悬空审批。
+      ctx.sandbox.disposeApprover();
+      disposeApprover();
+      cleanup();
+    },
+    'cli readline',
+  );
   // 注册 stdin 的 data 监听；cleanup 会负责移除它。
   process.stdin.on('data', onData);
 
@@ -233,12 +270,13 @@ export function apply(ctx: any, config: CliConfig = {}): void {
     }
 
     // currentAbort 非 null 代表上一轮尚未结束，避免并发改写同一个 session。
-    if (currentAbort) {
+    if (running || currentAbort) {
       console.log('[busy] wait for the current run to finish or press Esc.');
       return;
     }
 
     // 为这一次 send() 创建专用的取消控制器。
+    running = true;
     currentAbort = new AbortController();
     // 新一轮开始前重置“是否输出过正文”的标记。
     contentStarted = false;
@@ -295,6 +333,7 @@ export function apply(ctx: any, config: CliConfig = {}): void {
       // finally 无论 try 成功还是 catch 报错都会执行。
       // 把控制器恢复为 null，表示下一轮可以开始。
       currentAbort = null;
+      running = false;
       if (!disposed) rl.prompt();
     }
   };
@@ -310,6 +349,7 @@ export function apply(ctx: any, config: CliConfig = {}): void {
   // 启动提示信息只打印一次，然后显示第一轮输入提示符。
   console.log('mini-dsh CLI');
   console.log(`Model: ${model}`);
-  console.log('Type /help for commands. Press Esc to cancel a running request.');
+  console.log(`Sandbox workspace: ${ctx.sandbox.workspace}`);
+  console.log('Writes and bash execution ask [Y/n] first. Press Esc to cancel a run.');
   rl.prompt();
 }

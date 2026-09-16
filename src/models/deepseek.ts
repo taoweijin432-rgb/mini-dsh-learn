@@ -244,7 +244,7 @@ export function createDeepSeekAdapter(
   // 返回对象满足 ModelAdapter 接口：模型列表 + chat 方法。
   return {
     // 这些是当前适配器对外公布的可选模型名。
-    models: ['deepseek-v4-pro', 'deepseek-v4-flash'],
+    models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4-flash-262k'],
 
     // async 表示函数内部可以使用 await；返回值会自动包装成 Promise。
     async chat(request: ChatRequest): Promise<ChatResponse> {

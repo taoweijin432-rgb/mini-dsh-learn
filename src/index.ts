@@ -27,6 +27,14 @@ const agents = await import('./plugins/agents.js');
 const agentLoop = await import('./plugins/agent-loop.js');
 const runtimeContext = await import('./plugins/runtime-context.js');
 const deepseek = await import('./models/deepseek.js');
+const openai = await import('./models/openai.js');
+const sandbox = await import('./plugins/sandbox.js');
+const fileTools = await import('./tools/files.js');
+const bashTool = await import('./tools/bash.js');
+const externalPlugins = await import('./plugins/external-plugins.js');
+// plugins.config.js 必须在 dotenv.config() 之后动态加载，
+// 这样它才能读取 CONTEXT7_API_KEY。
+const externalPluginConfig = (await import('../plugins.config.js')).default;
 const cli = await import('./plugins/cli.js');
 
 // root.plugin 会把模块注册到 Cordis 上下文。
@@ -42,6 +50,14 @@ await root.plugin(agentLoop);
 await root.plugin(runtimeContext, { workspace });
 // DeepSeek 插件会读取 API key，并向 llm 服务注册适配器。
 await root.plugin(deepseek);
+// OpenAI 插件没有配置 API Key 时会跳过注册，不影响 DeepSeek。
+await root.plugin(openai);
+// 沙箱先于文件和 Bash 工具加载，工具启动时才能拿到 ctx.sandbox。
+await root.plugin(sandbox, { workspace });
+await root.plugin(fileTools);
+await root.plugin(bashTool);
+// 外部插件需要先完成 MCP 连接和工具注册，CLI 才能在 /tools 中看到它们。
+await root.plugin(externalPlugins, externalPluginConfig);
 // CLI 最后启动，因为它依赖前面已经装配完成的所有服务。
 await root.plugin(cli, {
   // CLI 的初始模型使用环境变量，缺失时回退到 pro 模型。
