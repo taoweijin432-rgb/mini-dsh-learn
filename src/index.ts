@@ -24,6 +24,7 @@ const systemPrompt = await import('./plugins/system-prompt.js');
 const tools = await import('./plugins/tools.js');
 const llm = await import('./plugins/llm.js');
 const agents = await import('./plugins/agents.js');
+const runs = await import('./plugins/runs.js');
 const agentLoop = await import('./plugins/agent-loop.js');
 const runtimeContext = await import('./plugins/runtime-context.js');
 const deepseek = await import('./models/deepseek.js');
@@ -44,6 +45,7 @@ await root.plugin(systemPrompt);
 await root.plugin(tools);
 await root.plugin(llm);
 await root.plugin(agents);
+await root.plugin(runs);
 await root.plugin(agentLoop);
 
 // 运行时上下文需要 workspace 配置；第二个参数就是插件配置对象。

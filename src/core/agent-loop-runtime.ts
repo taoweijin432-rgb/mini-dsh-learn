@@ -1,294 +1,322 @@
 // src/core/agent-loop-runtime.ts
-// 这个文件负责真正的 Agent Loop：问模型、执行工具、记录结果，再继续问模型。
+//
+// Agent Loop 负责“问模型 → 执行工具 → 再问模型”。
+// RunRuntime 负责这次运行的生命周期和边界，两者故意分开：
+// Loop 关注业务步骤，Run 关注什么时候开始、什么时候必须停止、为什么结束。
 
-// 下面全部是类型导入。真正的 Runtime 实例会从构造函数注入。
 import type { Agent } from './agent-runtime.js';
 import type { ChatRequest, ChatResponse, LlmRuntime } from './llm-runtime.js';
 import type { SystemPromptRuntime } from './system-prompt-runtime.js';
 import type { SessionRuntime } from './session-runtime.js';
+import {
+  RunBoundaryError,
+  type ActiveRun,
+  type RunEndReason,
+  type RunLimitsInput,
+  type RunRegistry,
+} from './run-runtime.js';
 import type {
   ExecutionResult,
   ToolRuntime,
 } from './tool-runtime.js';
 
-/**
- * Agent Loop 运行时需要的取消和流式回调。
- */
+/** Agent.send() 可以传入的运行级配置。 */
 export interface AgentRunOptions {
-  // AbortSignal 是只读的取消状态；调用者通过 AbortController.abort() 触发它。
+  // AbortSignal 由调用者触发；RunRuntime 会把它纳入自己的生命周期信号。
   signal?: AbortSignal;
 
-  // 模型每流出一小段“推理文本”时调用，常用于实时显示思考过程。
+  // 一次运行的边界。未提供的字段使用 RunRuntime 默认值。
+  limits?: RunLimitsInput;
+
+  // 模型每流出一小段“推理文本”时调用。
   onReasoning?: (chunk: string) => void;
 
-  // 模型每流出一小段“最终回答”时调用，常用于打字机效果。
+  // 模型每流出一小段“最终回答”时调用。
   onContent?: (chunk: string) => void;
 
-  // 每个工具真正开始执行前调用，方便 UI 显示“正在调用 xxx”。
+  // 每个工具真正开始执行前调用。
   onToolCall?: (call: AgentToolCall) => void;
 
-  // 每个工具完成并格式化结果后调用，方便 UI 展示执行结果。
+  // 每个工具完成并格式化结果后调用。
   onToolResult?: (result: AgentToolResult) => void;
 }
 
-/**
- * 模型要求调用工具时的一条调用指令。
- */
+/** 模型要求调用工具时的一条调用指令。 */
 export interface AgentToolCall {
-  // 一次工具调用的唯一 ID；后面的 tool result 必须用相同 ID 与它配对。
   id: string;
-
-  // ToolRuntime 中注册的工具名。
   name: string;
-
-  // 模型为该工具生成的参数对象。
   arguments: any;
+  runId?: string;
+  traceId?: string;
+  step?: number;
 }
 
-/**
- * 发送给 onToolResult 的信息。
- *
- * 它在原始 ExecutionResult 上增加工具名称、调用 ID，
- * 以及已经适合写入 Session 的字符串结果。
- */
+/** 发送给 onToolResult 的信息。 */
 export type AgentToolResult = ExecutionResult & {
-  // 补上工具名，让回调接收者不必再根据 ID 反查工具。
   name: string;
-
-  // 指向原始 AgentToolCall.id，用来关联“调用”和“结果”。
   toolCallId: string;
-
-  // ToolRuntime 把内容块转成的字符串，可直接写入 Session 并发给模型。
   renderedContent: string;
+  runId?: string;
+  traceId?: string;
+  step?: number;
 };
 
-/**
- * Agent Loop 的依赖。
- *
- * Loop 本身不创建这些对象，而是由外部注入，
- * 这样测试时可以传入 mock，生产环境再传入真实实现。
- */
+/** Agent Loop 的依赖。 */
 export interface AgentLoopDependencies {
-  // Session 是权威事件日志：既负责记录事件，也负责投影模型 messages。
+  // Session 是权威事件日志；模型 messages 从它投影出来。
   sessions: SessionRuntime;
-
-  // 每一轮根据 Agent、Session 和 step 动态组装 system prompt。
   systemPrompt: SystemPromptRuntime;
-
-  // 提供工具 schema、工具执行和结果渲染能力。
   tools: ToolRuntime;
-
-  // 根据 agent.model 选择 provider/model，并发送 ChatRequest。
   llm: LlmRuntime;
+
+  // RunRegistry 记录本次请求的边界和结束原因。
+  runs: RunRegistry;
 }
 
-/**
- * AgentRuntime 所需要的最小 Loop 接口。
- *
- * Agent 只知道“有一个 run 方法”，不需要知道 Loop 的内部细节。
- */
+/** Agent 只需要知道 Loop 有一个 run 方法。 */
 export interface AgentLoop {
-  // 只暴露一个最小 run() 契约，使 AgentRuntime 不依赖具体实现类。
   run(agent: Agent, input: string, options?: AgentRunOptions): Promise<string>;
 }
 
-/**
- * 取消时写入 Session 的工具结果。
- *
- * 不能只抛异常：
- * 如果 assistant/tool_calls 已经写入，但缺少对应的 tool/result，
- * 下一次把历史发送给模型时，消息结构就不完整了。
- */
+/** 被取消且尚未执行的工具，必须写入配对结果。 */
 export const CANCELLED_RESULT =
   'ToolError: the run was cancelled before this tool ran';
 
+/** 因运行边界未执行的工具也要有结果，避免 assistant/tool 历史断裂。 */
+export const BOUNDARY_RESULT =
+  'ToolError: the run boundary stopped this tool before it ran';
+
 /**
- * Agent Loop：整个 Agent 的核心循环。
+ * Agent Loop 的核心实现。
  *
- * 每一轮的流程是：
- *
- * 1. 重新组装 system prompt；
- * 2. 从 Session 事件日志投影 messages；
- * 3. 调用 LLM；
- * 4. 如果模型返回工具调用，就全部执行；
- * 5. 把工具结果写回 Session；
- * 6. 回到第 1 步，直到模型不再要求调用工具。
+ * 与真实 DSH 的对应关系：
+ * - 本项目的 Run，大致对应 DSH 的一个 turn；
+ * - 本项目的 step，对应“一个模型请求及其工具执行”；
+ * - Session 的 run/step 事件，承担 DSH turn/step 事件的学习版职责。
  */
 export class AgentLoopRuntime implements AgentLoop {
-  // readonly 表示构造完成后不能把依赖替换成另一个 Runtime。
   private readonly sessions: SessionRuntime;
   private readonly systemPrompt: SystemPromptRuntime;
   private readonly tools: ToolRuntime;
   private readonly llm: LlmRuntime;
+  private readonly runs: RunRegistry;
 
   constructor(dependencies: AgentLoopDependencies) {
-    // 构造函数只“接线”，不在类内部 new 依赖。
-    // 生产环境可以注入真实服务，测试则可以注入可控的 mock。
     this.sessions = dependencies.sessions;
     this.systemPrompt = dependencies.systemPrompt;
     this.tools = dependencies.tools;
     this.llm = dependencies.llm;
+    this.runs = dependencies.runs;
   }
 
-  /**
-   * 执行一次完整的 Agent 请求。
-   */
+  /** 执行一次完整的 Agent 请求，并保证 Run 最终一定关闭。 */
   async run(
     agent: Agent,
     input: string,
-    // 第三个参数默认是空对象，所以 agent.send(input) 不传配置也能安全解构。
     {
       signal,
+      limits,
       onReasoning,
       onContent,
       onToolCall,
       onToolResult,
-    }: AgentRunOptions = {}
+    }: AgentRunOptions = {},
   ): Promise<string> {
-    // 后续所有事件都写入 Agent 绑定的同一个 Session。
     const sessionId = agent.sessionId;
+    const run = this.runs.start({
+      agentId: agent.id,
+      sessionId,
+      signal,
+      limits,
+    });
 
-    // 用户输入是整个事件链的起点。
-    // 必须先写入，后面的 deriveMessages() 才能把本次问题发给模型。
-    this.sessions.append(sessionId, 'user/message', { content: input });
+    // 先写生命周期事件，再写用户消息。
+    // 这样恢复或审计时能明确知道这条消息属于哪次运行。
+    this.sessions.append(sessionId, 'run/start', {
+      runId: run.id,
+      traceId: run.state.traceId,
+      agentId: agent.id,
+      limits: run.state.limits,
+    });
+    this.sessions.append(sessionId, 'user/message', {
+      content: input,
+      runId: run.id,
+      traceId: run.state.traceId,
+    });
 
-    // step 从 0 开始，在每轮循环开头加 1，因此第一轮传给 prompt 的是 1。
-    let step = 0;
+    try {
+      while (true) {
+        // beginStep 会在进入模型前检查取消、超时和 maxSteps。
+        const step = run.beginStep();
+        this.sessions.append(sessionId, 'step/start', {
+          runId: run.id,
+          traceId: run.state.traceId,
+          step,
+        });
 
-    // 学习版故意不设置 maxSteps。
-    // 正常结束条件只有：模型不再返回 toolCalls。
-    while (true) {
-      step += 1;
+        let stepOutcome: 'completed' | 'stopped' | 'error' = 'stopped';
+        try {
+          const system = await this.systemPrompt.assemble({
+            agent,
+            sessionId,
+            runId: run.id,
+            traceId: run.state.traceId,
+            step,
+          });
+          const messages = this.sessions.deriveMessages(sessionId);
+          const request: ChatRequest = {
+            system,
+            messages,
+            tools: this.tools.schemas(),
+            // 使用 Run 自己的 signal，而不是裸的调用者 signal。
+            // 这样 maxDurationMs、用户取消和未来 shutdown 都能进入同一条链路。
+            signal: run.signal,
+            // Provider 只负责产生片段，Run 负责决定片段是否还能继续向 UI 输出。
+            onReasoning: chunk => {
+              if (run.consumeOutput(chunk)) onReasoning?.(chunk);
+            },
+            onContent: chunk => {
+              if (run.consumeOutput(chunk)) onContent?.(chunk);
+            },
+          };
 
-      // 每次进入模型前都检查取消状态。
-      // 这里还没有为本轮写入 assistant/tool_calls，所以可以立即抛错。
-      if (signal?.aborted) {
-        throw new Error('Agent run cancelled');
-      }
+          const response: ChatResponse = await this.llm.chat(request, agent.model);
+          // 适配器可能没有及时响应 AbortSignal；返回后仍要再次检查 Run 边界。
+          if (run.stopRequested) throw run.toError();
+          const toolCalls = (response.toolCalls ?? []) as AgentToolCall[];
 
-      // system prompt 必须每一步重新组装，
-      // 因为它可能包含当前时间、会话状态等动态内容。
-      const system = await this.systemPrompt.assemble({
-        agent,
-        sessionId,
-        step,
-      });
+          if (toolCalls.length === 0) {
+            const content = response.content ?? '';
+            this.sessions.append(sessionId, 'assistant/message', {
+              content,
+              runId: run.id,
+              traceId: run.state.traceId,
+              step,
+            });
+            stepOutcome = 'completed';
+            run.finish({ kind: 'completed' });
+            return content;
+          }
 
-      // 不直接拼消息，而是从 Session 的事件日志重新投影。
-      // 这样只维护一份权威历史，避免 events 和 messages 相互不一致。
-      const messages = this.sessions.deriveMessages(sessionId);
-
-      // ChatRequest 允许携带额外字段，model 会在 LlmRuntime 内部补上。
-      const request: ChatRequest = {
-        system,
-        messages,
-
-        // schemas() 只把工具说明交给模型，并不会在这里执行工具。
-        tools: this.tools.schemas(),
-
-        // 把同一个取消信号继续向下传给模型适配器。
-        signal,
-
-        // 模型产生流式片段时，LlmRuntime 会调用这两个回调。
-        onReasoning,
-        onContent,
-      };
-
-      // agent.model 的格式是 provider/model，由 LlmRuntime 完成模型路由。
-      const response: ChatResponse = await this.llm.chat(request, agent.model);
-
-      // 某些模型不返回 toolCalls 字段；?? [] 将 undefined 统一为空数组。
-      const toolCalls = (response.toolCalls ?? []) as AgentToolCall[];
-
-      // 没有工具调用，说明模型已经给出最终回答。
-      if (toolCalls.length === 0) {
-        // content 也可能缺失，学习版统一把它当作空字符串。
-        const content = response.content ?? '';
-
-        // 最终回答先写回 Session，再返回给 agent.send() 的调用者。
-        this.sessions.append(sessionId, 'assistant/message', { content });
-        return content;
-      }
-
-      // 先完整记录 assistant 的工具调用消息。
-      // reasoningContent 必须和本轮 toolCalls 一起保存。
-      // 内部字段叫 toolCalls，Session 投影成 API 消息时会变成 tool_calls。
-      this.sessions.append(sessionId, 'assistant/tool_calls', {
-        // 模型可能只返回工具调用而没有普通文字，此时使用 null。
-        content: response.content ?? null,
-        reasoningContent: response.reasoningContent,
-        toolCalls,
-      });
-
-      // 这里不能在工具循环中途直接 throw。
-      // 否则剩余 tool_call 没有对应的 tool/result，历史就会损坏。
-      let cancelled = false;
-
-      // 一轮模型可能同时要求多个工具，必须全部处理完再回模型。
-      for (const call of toolCalls) {
-        // 如果上一个工具执行期间触发了取消，
-        // 当前以及后续调用都不再真正执行。
-        // ||= 会让 cancelled 一旦变成 true，就在剩余循环中一直保持 true。
-        cancelled ||= Boolean(signal?.aborted);
-
-        if (cancelled) {
-          // 为每个未执行的调用补一条取消结果，保持日志配对。
-          // 不能直接 break，否则更后面的 tool call 仍然没有结果。
-          this.sessions.append(sessionId, 'tool/result', {
-            toolCallId: call.id,
-            name: call.name,
-            isError: true,
-            content: CANCELLED_RESULT,
+          this.sessions.append(sessionId, 'assistant/tool_calls', {
+            content: response.content ?? null,
+            reasoningContent: response.reasoningContent,
+            toolCalls,
+            runId: run.id,
+            traceId: run.state.traceId,
+            step,
           });
 
-          // continue 会继续处理下一个调用，为它也补上取消结果。
-          continue;
+          // 必须遍历完整个 toolCalls：即使运行被取消，也要为每个调用补 result。
+          let stoppedDuringTools = false;
+          for (const rawCall of toolCalls) {
+            const call: AgentToolCall = { ...rawCall, runId: run.id, traceId: run.state.traceId, step };
+
+            if (run.stopRequested) {
+              stoppedDuringTools = true;
+              this.appendStoppedToolResult(sessionId, call, run);
+              continue;
+            }
+
+            try {
+              // 预算检查放在工具真正启动之前。
+              run.consumeToolCall();
+            } catch (error) {
+              stoppedDuringTools = true;
+              this.appendStoppedToolResult(sessionId, call, run);
+              continue;
+            }
+
+            onToolCall?.(call);
+            const result = await this.tools.execute(call.name, call.arguments, {
+              signal: run.signal,
+              sessionId,
+              toolCallId: call.id,
+              agent,
+            });
+            const renderedContent = this.tools.renderResult(result);
+            const toolResult: AgentToolResult = {
+              ...result,
+              renderedContent,
+              name: call.name,
+              toolCallId: call.id,
+              runId: run.id,
+              traceId: run.state.traceId,
+              step,
+            };
+
+            onToolResult?.(toolResult);
+            this.sessions.append(sessionId, 'tool/result', {
+              toolCallId: call.id,
+              name: call.name,
+              isError: result.isError,
+              content: renderedContent,
+              runId: run.id,
+              traceId: run.state.traceId,
+              step,
+            });
+          }
+
+          if (stoppedDuringTools || run.stopRequested) {
+            throw run.toError();
+          }
+          stepOutcome = 'completed';
+        } catch (error) {
+          stepOutcome = 'error';
+          throw error;
+        } finally {
+          // 与真实 DSH 的 step/end 一样，即使模型或工具失败，也要关闭 step 边界。
+          this.sessions.append(sessionId, 'step/end', {
+            runId: run.id,
+            traceId: run.state.traceId,
+            step,
+            outcome: stepOutcome,
+          });
         }
-
-        // 通知 UI 或 CLI：准备执行哪一个工具。
-        // ?. 表示调用者没传回调时什么也不做。
-        onToolCall?.(call);
-
-        // ToolRuntime 会负责找到工具、执行函数并统一捕获错误。
-        const result = await this.tools.execute(call.name, call.arguments, {
-          // 把当前运行上下文交给工具；工具可以据此响应取消或记录关联信息。
-          signal,
-          sessionId,
-          toolCallId: call.id,
-          agent,
-        });
-
-        // 模型下一轮需要文本，所以把内容块渲染成字符串。
-        const renderedContent = this.tools.renderResult(result);
-
-        // ...result 复制 value、content、isError，再补充 Agent Loop 关心的字段。
-        const toolResult: AgentToolResult = {
-          ...result,
-          renderedContent,
-          name: call.name,
-          toolCallId: call.id,
-        };
-
-        // 通知 UI 或 CLI：工具已经返回结果。
-        // 这个回调只负责观察结果，不代替下面的 Session 记录。
-        onToolResult?.(toolResult);
-
-        // 工具结果必须和 tool_call_id 对应，模型才能继续理解历史。
-        this.sessions.append(sessionId, 'tool/result', {
-          toolCallId: call.id,
-          name: call.name,
-          isError: result.isError,
-          content: renderedContent,
-        });
+      }
+    } catch (error) {
+      const reason = run.reasonFor(error);
+      run.finish(reason);
+      // 对边界类错误统一使用稳定消息；普通模型/工具错误保留原始错误。
+      if (reason.kind !== 'error') throw run.toError();
+      throw error;
+    } finally {
+      if (!run.isFinished) {
+        // 理论上的最后保险：任何未来新增的 return/throw 分支都不能留下开放 Run。
+        run.finish(run.reasonFor(new Error('run ended without an explicit result')));
       }
 
-      // 所有工具调用都已经写入日志后，才真正结束本次取消。
-      // 到这里，每个 tool call 都有真实结果或 CANCELLED_RESULT。
-      if (cancelled) {
-        throw new Error('Agent run cancelled');
-      }
-
-      // 没有 return、throw 时，while 会回到顶部，让模型读取刚写入的工具结果。
+      const state = run.state;
+      this.sessions.append(sessionId, 'run/end', {
+        runId: run.id,
+        traceId: state.traceId,
+        status: state.status,
+        reason: state.stopReason,
+        currentStep: state.currentStep,
+        toolCalls: state.toolCalls,
+        outputBytes: state.outputBytes,
+      });
     }
+  }
+
+  /** 为未执行的 tool call 写入与 assistant/tool_calls 配对的结果。 */
+  private appendStoppedToolResult(
+    sessionId: string,
+    call: AgentToolCall,
+    run: ActiveRun,
+  ): void {
+    const content = run.stopReason?.kind === 'cancelled'
+      ? CANCELLED_RESULT
+      : BOUNDARY_RESULT;
+
+    this.sessions.append(sessionId, 'tool/result', {
+      toolCallId: call.id,
+      name: call.name,
+      isError: true,
+      content,
+      runId: run.id,
+      traceId: run.state.traceId,
+      step: call.step,
+    });
   }
 }

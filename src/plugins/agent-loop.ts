@@ -13,10 +13,10 @@ import type { Agent } from '../core/agent-runtime.js';
 /**
  * Agent Loop 依赖的 Cordis 服务名称。
  *
- * Cordis 会等 sessions、systemPrompt、tools、llm 都准备好后，
+ * Cordis 会等 sessions、systemPrompt、tools、llm、runs 都准备好后，
  * 才创建 AgentLoopService。
  */
-export const inject = ['sessions', 'systemPrompt', 'tools', 'llm'];
+export const inject = ['sessions', 'systemPrompt', 'tools', 'llm', 'runs'];
 
 export class AgentLoopService extends Service {
   // 除了插件对象上的 inject，类本身也声明一次依赖。
@@ -36,6 +36,7 @@ export class AgentLoopService extends Service {
       systemPrompt: ctx.systemPrompt,
       tools: ctx.tools,
       llm: ctx.llm,
+      runs: ctx.runs,
     };
 
     // 将框架服务注入普通 TypeScript 类，核心代码因此不需要知道 Cordis。

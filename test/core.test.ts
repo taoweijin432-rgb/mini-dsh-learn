@@ -10,6 +10,7 @@ import { LlmRuntime } from '../src/core/llm-runtime.js';
 import { SessionRuntime } from '../src/core/session-runtime.js';
 import { SystemPromptRuntime } from '../src/core/system-prompt-runtime.js';
 import { ToolRuntime } from '../src/core/tool-runtime.js';
+import { RunRuntime } from '../src/core/run-runtime.js';
 
 test('Session derives tool-call history from the event log and keeps reasoning_content', () => {
   const sessions = new SessionRuntime();
@@ -174,7 +175,7 @@ test('Agent loop completes a model -> tool -> model turn', async () => {
 
   // Arrange：把 Session、模型和 Loop 绑定成一个可调用的 Agent。
   const s = sessions.create();
-  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm });
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs: new RunRuntime() });
   const agent = agents.create({
     sessionId: s.id,
     model: 'mock/demo',
@@ -189,7 +190,7 @@ test('Agent loop completes a model -> tool -> model turn', async () => {
   assert.equal(calls, 2);
 });
 
-test('Agent loop has no 12-step cap and finishes after 20 tool calls', async () => {
+test('Run default step budget allows a 20-tool-call task to finish', async () => {
   // Arrange：仍然使用纯内存依赖，测试不会发起真实网络请求。
   const sessions = new SessionRuntime();
   const systemPrompt = new SystemPromptRuntime();
@@ -235,14 +236,14 @@ test('Agent loop has no 12-step cap and finishes after 20 tool calls', async () 
 
   // Arrange：创建本次长任务专用的 Session、Loop 和 Agent。
   const s = sessions.create();
-  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm });
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs: new RunRuntime() });
   const agent = agents.create({
     sessionId: s.id,
     model: 'mock/long',
     loop,
   });
 
-  // Act：如果实现里存在隐藏的 12 步上限，这里会提前抛错。
+  // Act：默认 maxSteps 是 30，因此 20 次工具调用应该仍能完成；真正的预算行为由 Run 测试单独覆盖。
   const answer = await agent.send('run a long task');
 
   // Assert：20 次工具调用后还要再调用一次模型，才能得到最终答案。
@@ -300,7 +301,7 @@ test('Agent loop streams reasoning, content, tool-call, and tool-result chunks',
 
   // Arrange：创建 Agent。
   const s = sessions.create();
-  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm });
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs: new RunRuntime() });
   const agent = agents.create({
     sessionId: s.id,
     model: 'mock/stream-model',
@@ -375,7 +376,7 @@ test('Cancelling a multi-tool turn still records a result for every tool_call', 
 
   // Arrange：创建 Agent，并让它使用上面的取消信号运行。
   const s = sessions.create();
-  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm });
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs: new RunRuntime() });
   const agent = agents.create({ sessionId: s.id, model: 'mock/demo', loop });
 
   // Act + Assert：对调用者来说，本次 send() 最终必须以取消异常结束。
@@ -690,4 +691,210 @@ test('glob matches both substrings and * / ** wildcards', async () => {
   assert.equal(matchFilePattern('docs/guide.md', '*.md'), true);
   assert.equal(matchFilePattern('src/tools/bash.js', '**/*.js'), true);
   assert.equal(matchFilePattern('README.md', '**/*.js'), false);
+});
+
+
+test('Run lifecycle records run and step boundaries', async () => {
+  const sessions = new SessionRuntime();
+  const systemPrompt = new SystemPromptRuntime();
+  const tools = new ToolRuntime();
+  const llm = new LlmRuntime();
+  const runs = new RunRuntime();
+  const agents = new AgentRuntime();
+  const session = sessions.create();
+
+  llm.register('mock', {
+    models: ['demo'],
+    chat: async () => ({ content: 'done', toolCalls: [] }),
+  });
+
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs });
+  const agent = agents.create({ sessionId: session.id, model: 'mock/demo', loop });
+
+  assert.equal(await agent.send('hello'), 'done');
+
+  const state = runs.list()[0];
+  assert.ok(state);
+  assert.equal(state.status, 'completed');
+  assert.match(state.traceId, /^[0-9a-f-]{36}$/);
+  assert.equal(state.currentStep, 1);
+  assert.equal(state.toolCalls, 0);
+  assert.deepEqual(state.stopReason, { kind: 'completed' });
+
+  assert.deepEqual(
+    session.events.map(event => event.type),
+    [
+      'session/start',
+      'run/start',
+      'user/message',
+      'step/start',
+      'assistant/message',
+      'step/end',
+      'run/end',
+    ],
+  );
+  assert.equal(session.events[1].data.runId, state.id);
+  assert.equal(session.events[1].data.traceId, state.traceId);
+  assert.equal(session.events.at(-1)?.data.reason.kind, 'completed');
+});
+
+test('Run maxSteps closes the run with a structured budget reason', async () => {
+  const sessions = new SessionRuntime();
+  const systemPrompt = new SystemPromptRuntime();
+  const tools = new ToolRuntime();
+  const llm = new LlmRuntime();
+  const runs = new RunRuntime();
+  const agents = new AgentRuntime();
+  const session = sessions.create();
+  let calls = 0;
+
+  tools.register({
+    name: 'tick',
+    description: 'tick',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => 'ok',
+  });
+  llm.register('mock', {
+    models: ['demo'],
+    chat: async () => {
+      calls += 1;
+      return { toolCalls: [{ id: `tick-${calls}`, name: 'tick', arguments: {} }] };
+    },
+  });
+
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs });
+  const agent = agents.create({ sessionId: session.id, model: 'mock/demo', loop });
+
+  await assert.rejects(
+    () => agent.send('keep going', {
+      limits: { maxSteps: 2, maxToolCalls: 10, maxDurationMs: 1_000 },
+    }),
+    /exceeded max steps \(2\)/,
+  );
+
+  const state = runs.list()[0];
+  assert.ok(state);
+  assert.equal(state.status, 'budget_exceeded');
+  assert.deepEqual(state.stopReason, { kind: 'max-steps', limit: 2 });
+  assert.equal(state.currentStep, 2);
+  assert.equal(session.events.filter(event => event.type === 'step/end').length, 2);
+  assert.equal(session.events.at(-1)?.type, 'run/end');
+});
+
+test('Run maxToolCalls keeps every tool-call/result pair before stopping', async () => {
+  const sessions = new SessionRuntime();
+  const systemPrompt = new SystemPromptRuntime();
+  const tools = new ToolRuntime();
+  const llm = new LlmRuntime();
+  const runs = new RunRuntime();
+  const agents = new AgentRuntime();
+  const session = sessions.create();
+  let executed = 0;
+
+  tools.register({
+    name: 'echo',
+    description: 'echo',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      executed += 1;
+      return 'executed';
+    },
+  });
+  llm.register('mock', {
+    models: ['demo'],
+    chat: async () => ({
+      toolCalls: [
+        { id: 'echo-1', name: 'echo', arguments: {} },
+        { id: 'echo-2', name: 'echo', arguments: {} },
+      ],
+    }),
+  });
+
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs });
+  const agent = agents.create({ sessionId: session.id, model: 'mock/demo', loop });
+
+  await assert.rejects(
+    () => agent.send('use one tool', {
+      limits: { maxSteps: 5, maxToolCalls: 1, maxDurationMs: 1_000 },
+    }),
+    /exceeded max tool calls \(1\)/,
+  );
+
+  const results = session.events.filter(event => event.type === 'tool/result');
+  assert.equal(executed, 1);
+  assert.equal(results.length, 2);
+  assert.equal(results[1].data.content, 'ToolError: the run boundary stopped this tool before it ran');
+  assert.deepEqual(runs.list()[0].stopReason, { kind: 'max-tool-calls', limit: 1 });
+});
+
+test('Run timeout wins even when a model adapter ignores AbortSignal', async () => {
+  const sessions = new SessionRuntime();
+  const systemPrompt = new SystemPromptRuntime();
+  const tools = new ToolRuntime();
+  const llm = new LlmRuntime();
+  const runs = new RunRuntime();
+  const agents = new AgentRuntime();
+  const session = sessions.create();
+
+  llm.register('mock', {
+    models: ['demo'],
+    chat: async () => {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      return { content: 'late answer', toolCalls: [] };
+    },
+  });
+
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs });
+  const agent = agents.create({ sessionId: session.id, model: 'mock/demo', loop });
+
+  await assert.rejects(
+    () => agent.send('finish quickly', {
+      limits: { maxSteps: 5, maxToolCalls: 5, maxDurationMs: 5 },
+    }),
+    /timed out after 5ms/,
+  );
+
+  const state = runs.list()[0];
+  assert.ok(state);
+  assert.equal(state.status, 'timed_out');
+  assert.deepEqual(state.stopReason, { kind: 'timeout', timeoutMs: 5 });
+  assert.equal(session.events.at(-1)?.type, 'run/end');
+});
+
+
+test('Run output budget stops streamed model output with a structured reason', async () => {
+  const sessions = new SessionRuntime();
+  const systemPrompt = new SystemPromptRuntime();
+  const tools = new ToolRuntime();
+  const llm = new LlmRuntime();
+  const runs = new RunRuntime();
+  const agents = new AgentRuntime();
+  const session = sessions.create();
+  const visible: string[] = [];
+
+  llm.register('mock', {
+    models: ['demo'],
+    chat: async ({ onContent }: any) => {
+      onContent?.('123456');
+      return { content: 'late answer', toolCalls: [] };
+    },
+  });
+
+  const loop = new AgentLoopRuntime({ sessions, systemPrompt, tools, llm, runs });
+  const agent = agents.create({ sessionId: session.id, model: 'mock/demo', loop });
+
+  await assert.rejects(
+    () => agent.send('do not overflow', {
+      limits: { maxSteps: 5, maxToolCalls: 5, maxDurationMs: 1_000, maxOutputBytes: 5 },
+      onContent: chunk => visible.push(chunk),
+    }),
+    /exceeded max output bytes \(5\)/,
+  );
+
+  assert.deepEqual(visible, []);
+  const state = runs.list()[0];
+  assert.ok(state);
+  assert.equal(state.status, 'budget_exceeded');
+  assert.equal(state.outputBytes, 5);
+  assert.deepEqual(state.stopReason, { kind: 'max-output-bytes', limit: 5 });
 });

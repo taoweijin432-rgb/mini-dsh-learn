@@ -7,8 +7,12 @@
  * 谁说了什么、助手调用了什么工具、工具返回了什么。
  * 这种设计通常叫“事件日志”。
  */
-type EventType =
+export type EventType =
   | 'session/start' // 会话创建或清空后的起点
+  | 'run/start' // 一次用户请求的运行开始
+  | 'run/end' // 一次用户请求的运行结束
+  | 'step/start' // 一次模型调用及其工具执行开始
+  | 'step/end' // 一次模型调用及其工具执行结束
   | 'user/message' // 用户发送了一条消息
   | 'assistant/message' // 助手发送了一条普通消息
   | 'assistant/tool_calls' // 助手请求调用工具
@@ -17,7 +21,7 @@ type EventType =
 /**
  * 事件日志中的一条记录。
  */
-interface BaseEvent {
+export interface BaseEvent {
   seq: number; // 全局递增序号，用于判断事件顺序
   type: EventType; // 事件属于哪一种
   at: string; // 发生时间，使用 ISO datetime 字符串
@@ -202,7 +206,11 @@ export class SessionRuntime {
           break;
 
         case 'session/start':
-          // session/start 只是日志控制事件，不应该发送给大模型。
+        case 'run/start':
+        case 'run/end':
+        case 'step/start':
+        case 'step/end':
+          // 生命周期事件只服务于恢复、审计和 UI，不应该发送给大模型。
           break;
       }
     }
